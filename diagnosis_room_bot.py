@@ -3,12 +3,8 @@ import io
 import json
 import random
 import logging
-import textwrap
-import threading
-import urllib.parse
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import requests
-from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -28,7 +24,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_ID = "gemini-3.6-flash"
+
+# Fallback model chain: tries the newest stable models first, falling back if unavailable
+MODEL_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -43,6 +41,28 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
+def generate_gemini_response(prompt_text):
+    """Loops through the model fallback chain with automatic retries for high demand / errors."""
+    for model_id in MODEL_CHAIN:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt_text,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.7,
+                    ),
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                logger.warning(f"Model {model_id} attempt {attempt + 1} failed: {e}")
+                if attempt < 1:
+                    time.sleep(1)
+        logger.info(f"Switching away from model {model_id}...")
+    raise RuntimeError("All Gemini model fallback attempts failed due to high traffic.")
+
 CASE_GENERATION_PROMPT = """
 You are an expert medical educator creating interactive clinical cases for clinical-year undergraduate medical (MBBS) students (400L - 600L level).
 Generate a realistic, high-yield clinical case for the specialty: {specialty}.
@@ -56,11 +76,10 @@ Return ONLY valid JSON matching this exact structure:
     "history": "No significant medical history"
   }},
   "presenting_symptoms": [
-    "Symptom 1",
+    "Symptom 1 with duration",
     "Symptom 2",
     "Symptom 3",
-    "Symptom 4",
-    "Symptom 5"
+    "Symptom 4"
   ],
   "step1_question": "WHAT WOULD YOU DO NEXT?",
   "step1_options": {{
@@ -82,8 +101,7 @@ Return ONLY valid JSON matching this exact structure:
     "physical_exam": [
       "Exam finding 1",
       "Exam finding 2",
-      "Exam finding 3",
-      "Exam finding 4"
+      "Exam finding 3"
     ]
   }},
   "investigation_results": [
@@ -104,74 +122,11 @@ Return ONLY valid JSON matching this exact structure:
   "key_features_explained": [
     "Feature 1 -> mechanism",
     "Feature 2 -> mechanism",
-    "Feature 3 -> mechanism",
-    "Feature 4 -> mechanism"
+    "Feature 3 -> mechanism"
   ],
-  "next_step_management": "Clear summary of immediate management.",
-  "illustration_prompt_1": "minimalist flat vector medical icon of a stethoscope on pure solid white background",
-  "illustration_prompt_2": "minimalist flat vector medical icon of a patient monitor on pure solid white background",
-  "illustration_prompt_3": "minimalist flat vector medical icon of a first aid kit on pure solid white background"
+  "next_step_management": "Clear summary of immediate management."
 }}
 """
-
-def fetch_ai_illustration(prompt: str, size=(260, 260)):
-    try:
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=512&height=512&nologo=true&seed={random.randint(1, 99999)}"
-        res = requests.get(url, timeout=12)
-        if res.status_code == 200:
-            return Image.open(io.BytesIO(res.content)).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
-    except Exception:
-        pass
-    return None
-
-def get_font(size: int, bold: bool = False):
-    for path in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "arialbd.ttf" if bold else "arial.ttf"]:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
-
-def create_slide(title, sections, footer, illustration=None):
-    img = Image.new("RGB", (1080, 1600), color=(255, 255, 255))
-    draw = ImageDraw.Draw(img)
-    
-    draw.text((540, 70), "THE DIAGNOSIS ROOM", fill=(120, 130, 150), font=get_font(28, True), anchor="mm")
-    draw.text((540, 145), title.upper(), fill=(8, 20, 72), font=get_font(52, True), anchor="mm")
-    
-    y = 230
-    for sec_title, items, centered in sections:
-        if sec_title:
-            if centered:
-                draw.text((540, y), sec_title, fill=(8, 20, 72), font=get_font(36, True), anchor="mm")
-            else:
-                draw.text((110, y), sec_title, fill=(8, 20, 72), font=get_font(36, True))
-            y += 58
-        for item in items:
-            for i, line in enumerate(textwrap.wrap(str(item), width=42)):
-                if centered:
-                    draw.text((540, y), line, fill=(8, 20, 72), font=get_font(30, True), anchor="mm")
-                else:
-                    no_bullet = str(item).startswith(("A)", "B)", "C)", "D)", "Age:", "Gender:", "History:"))
-                    prefix = "" if no_bullet else ("• " if i == 0 else "   ")
-                    draw.text((130, y), f"{prefix}{line}", fill=(8, 20, 72), font=get_font(30, True))
-                y += 44
-            y += 8
-        y += 32
-
-    if illustration:
-        ill = fetch_ai_illustration(illustration, (260, 260))
-        if ill:
-            py = max(y + 10, 1260)
-            img.paste(ill, ((1080 - 260) // 2, py), ill)
-
-    draw.text((540, 1560), footer, fill=(120, 130, 150), font=get_font(24), anchor="mm")
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
 
 def build_specialty_keyboard():
     return InlineKeyboardMarkup([
@@ -187,7 +142,9 @@ def build_mcq_keyboard(options, prefix):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🩺 *Welcome to The Diagnosis Room!*\n\nPractice your clinical reasoning for MBBS exams with interactive cases.\n\n👇 *Select a specialty below to begin:*",
+        "🩺 *Welcome to The Diagnosis Room!*\n\n"
+        "Practice your clinical reasoning for MBBS exams with instant text-based cases.\n\n"
+        "👇 *Select a specialty below to begin:*",
         parse_mode="Markdown", reply_markup=build_specialty_keyboard()
     )
 
@@ -206,62 +163,97 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await query.message.reply_text(f"⏳ *Generating Case #{num} ({spec})...*", parse_mode="Markdown")
 
         try:
-            resp = client.models.generate_content(
-                model=MODEL_ID,
-                contents=CASE_GENERATION_PROMPT.format(specialty=spec, case_number=num),
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.7)
-            )
-            case_data = json.loads(resp.text)
+            prompt_text = CASE_GENERATION_PROMPT.format(specialty=spec, case_number=num)
+            raw_json = generate_gemini_response(prompt_text)
+            case_data = json.loads(raw_json)
             context.user_data["current_case"] = case_data
 
             p = case_data["patient_info"]
-            slide = create_slide(f"CASE #{num} ({spec.upper()})", [
-                ("PATIENT INFO", [f"Age: {p['age']}", f"Gender: {p['gender']}", f"History: {p['history']}"], False),
-                ("PRESENTING WITH", case_data["presenting_symptoms"], False),
-                (case_data["step1_question"], [f"{k}) {v}" for k, v in case_data["step1_options"].items()], False)
-            ], f"Clinical Case #{num} • Step 1 of 3", case_data.get("illustration_prompt_1"))
+            symptoms_list = "\n".join([f"• {sym}" for sym in case_data["presenting_symptoms"]])
+            
+            case_text = (
+                f"🏥 *THE DIAGNOSIS ROOM — CASE #{num}* ({spec.upper()})\n\n"
+                f"👤 *PATIENT INFO*\n"
+                f"• Age: {p['age']} | Gender: {p['gender']}\n"
+                f"• History: {p['history']}\n\n"
+                f"📋 *PRESENTING WITH*\n"
+                f"{symptoms_list}\n\n"
+                f"❓ *{case_data['step1_question']}*"
+            )
 
-            await query.message.reply_photo(photo=slide, caption=f"📋 *Case #{num} — {spec}*\n\n*{case_data['step1_question']}*", parse_mode="Markdown", reply_markup=build_mcq_keyboard(case_data["step1_options"], "step1"))
+            await query.message.reply_text(
+                case_text, 
+                parse_mode="Markdown", 
+                reply_markup=build_mcq_keyboard(case_data["step1_options"], "step1")
+            )
             await msg.delete()
         except Exception as e:
-            logger.error(f"Error: {e}")
-            await msg.edit_text("⚠️ Error generating case. Tap /start to try again.")
+            logger.error(f"Error generation: {e}")
+            await msg.edit_text("⚠️ High server traffic or connection delay. Tap /start to try a new case!")
 
     elif data.startswith("step1_"):
         choice = data.replace("step1_", "")
         c = context.user_data.get("current_case")
         if not c: return
         correct = c["step1_correct"]
-        fb = f"✅ *Correct!*" if choice == correct else f"❌ *Not quite.* Correct step: {correct})"
-        fb += f"\n\n💡 *Reasoning:*\n{c['step1_explanation']}"
+        user_text = c["step1_options"].get(choice, "")
+        correct_text = c["step1_options"].get(correct, "")
+
+        if choice == correct:
+            fb = f"✅ *Spot on! You chose {choice}) {user_text}*\n\n"
+        else:
+            fb = f"❌ *Not quite! You chose {choice}) {user_text}*\n✔️ *Best initial step:* {correct}) {correct_text}\n\n"
+        fb += f"💡 *Clinical Reasoning:*\n{c['step1_explanation']}"
         await query.message.reply_text(fb, parse_mode="Markdown")
 
         assess = c["clinical_assessment"]
-        slide = create_slide("CLINICAL ASSESSMENT", [
-            ("VITALS:", assess["vitals"], False),
-            ("PHYSICAL EXAM:", assess["physical_exam"], False),
-            ("RESULTS:", c["investigation_results"], False),
-            (c["step2_question"], [f"{k}) {v}" for k, v in c["step2_options"].items()], False)
-        ], f"Clinical Case #{c['case_number']} • Step 2 of 3", c.get("illustration_prompt_2"))
+        vitals_list = "\n".join([f"• {v}" for v in assess["vitals"]])
+        exam_list = "\n".join([f"• {e}" for e in assess["physical_exam"]])
+        results_list = "\n".join([f"• {r}" for r in c["investigation_results"]])
 
-        await query.message.reply_photo(photo=slide, caption=f"🩺 *Assessment & Results*\n\n*{c['step2_question']}*", parse_mode="Markdown", reply_markup=build_mcq_keyboard(c["step2_options"], "step2"))
+        assessment_text = (
+            f"🩺 *CLINICAL ASSESSMENT & RESULTS*\n\n"
+            f"⚡ *VITALS*\n{vitals_list}\n\n"
+            f"🔍 *PHYSICAL EXAM*\n{exam_list}\n\n"
+            f"🧪 *RESULTS*\n{results_list}\n\n"
+            f"❓ *{c['step2_question']}*"
+        )
+
+        await query.message.reply_text(
+            assessment_text, 
+            parse_mode="Markdown", 
+            reply_markup=build_mcq_keyboard(c["step2_options"], "step2")
+        )
 
     elif data.startswith("step2_"):
         choice = data.replace("step2_", "")
         c = context.user_data.get("current_case")
         if not c: return
         correct = c["step2_correct"]
-        verdict = f"🎉 *Correct Diagnosis!*" if choice == correct else f"❌ *Incorrect.* Correct diagnosis: {correct})"
+        user_text = c["step2_options"].get(choice, "")
+        correct_text = c["step2_options"].get(correct, "")
+
+        if choice == correct:
+            verdict = f"🎉 *Correct Diagnosis! ({choice}) {user_text}*"
+        else:
+            verdict = f"❌ *You selected {choice}) {user_text}*\n🎯 *The correct diagnosis is {correct}) {correct_text}*"
         await query.message.reply_text(verdict, parse_mode="Markdown")
 
-        slide = create_slide("THE DIAGNOSIS IS...", [
-            (c["final_diagnosis"], [c["diagnosis_summary"]], True),
-            ("KEY CLINICAL FEATURES:", c["key_features_explained"], False),
-            ("NEXT STEP / MANAGEMENT:", [c["next_step_management"]], True)
-        ], f"Clinical Case #{c['case_number']} • Step 3 of 3", c.get("illustration_prompt_3"))
+        features_list = "\n".join([f"• {f}" for f in c["key_features_explained"]])
 
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")], [InlineKeyboardButton("🗂 Choose Specialty", callback_data="start_menu")]])
-        await query.message.reply_photo(photo=slide, caption=f"🏁 *Diagnosis: {c['final_diagnosis']}*\n\n💬 *Have questions? Just type them below!*", parse_mode="Markdown", reply_markup=kb)
+        final_text = (
+            f"🏁 *THE DIAGNOSIS IS: {c['final_diagnosis']}*\n\n"
+            f"📖 *Pathophysiology Summary:*\n{c['diagnosis_summary']}\n\n"
+            f"🔑 *Key Features Explained:*\n{features_list}\n\n"
+            f"💊 *Next Step / Management:*\n{c['next_step_management']}\n\n"
+            f"💬 *Have questions about this case? Just type them below!*"
+        )
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")],
+            [InlineKeyboardButton("🗂 Choose Specialty", callback_data="start_menu")]
+        ])
+        await query.message.reply_text(final_text, parse_mode="Markdown", reply_markup=kb)
 
     elif data == "start_menu":
         await query.message.reply_text("👇 *Select a specialty:*", parse_mode="Markdown", reply_markup=build_specialty_keyboard())
@@ -271,9 +263,12 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not c:
         await update.message.reply_text("Tap /start to begin a case first!")
         return
-    resp = client.models.generate_content(model=MODEL_ID, contents=f"You are a warm clinical tutor. Case: {json.dumps(c)}. Student asks: {update.message.text}. Answer step-by-step.")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")]])
-    await update.message.reply_text(resp.text, reply_markup=kb)
+    try:
+        qa_text = generate_gemini_response(f"You are a warm clinical tutor helping an MBBS student. Case: {json.dumps(c)}. Student asks: {update.message.text}. Answer step-by-step.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")]])
+        await update.message.reply_text(qa_text, reply_markup=kb)
+    except Exception:
+        await update.message.reply_text("⚠️ High server traffic. Please try asking your question again!")
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
