@@ -4,7 +4,9 @@ import json
 import random
 import logging
 import textwrap
+import threading
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,12 +29,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Replace these with your actual keys or set them as environment variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
+# .strip() removes any accidental trailing spaces added by mobile keyboards
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_ID = "gemini-2.5-flash"
+
+
+# ==============================================================================
+# BUILT-IN RENDER HEALTH CHECK SERVER (KEEPS RENDER WEB SERVICE HAPPY)
+# ==============================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"The Diagnosis Room Bot is running!")
+
+    def log_message(self, format, *args):
+        return  # Silence HTTP logs
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check server listening on port {port}")
+    server.serve_forever()
+
 
 # ==============================================================================
 # SYSTEM PROMPT FOR UNDERGRADUATE MBBS CLINICAL CASES
@@ -117,28 +140,30 @@ Return ONLY valid JSON matching this exact structure:
 }}
 """
 
+
 # ==============================================================================
 # AI ILLUSTRATION + "THE DIAGNOSIS ROOM" SLIDE GENERATOR
 # ==============================================================================
-def fetch_ai_illustration(prompt: str, size=(260, 260)) -> Image.Image:
-    """Fetches a free AI-generated minimalist medical illustration from Pollinations AI."""
+def fetch_ai_illustration(prompt: str, size=(260, 260)):
+    """Fetches a free AI-generated minimalist medical illustration."""
     try:
         encoded_prompt = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512&nologo=true&seed={random.randint(1, 99999)}"
+        seed = random.randint(1, 99999)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512&nologo=true&seed={seed}"
         response = requests.get(url, timeout=12)
         if response.status_code == 200:
             img = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            img = img.resize(size, Image.Resampling.LANCZOS)
-            return img
+            return img.resize(size, Image.Resampling.LANCZOS)
     except Exception as e:
-        logger.warning(f"Could not fetch AI illustration, using fallback icon: {e}")
+        logger.warning(f"Could not fetch AI illustration: {e}")
     return None
 
 
 def get_font(size: int, bold: bool = False):
-    """Loads a clean sans-serif font with fallback to default."""
     font_candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "arialbd.ttf" if bold else "arial.ttf",
     ]
     for path in font_candidates:
@@ -156,10 +181,6 @@ def create_slide_image(
     footer_text: str,
     illustration_prompt: str = None,
 ) -> io.BytesIO:
-    """
-    Creates a clean vertical 'Diagnosis Room' style slide card (1080x1600)
-    with navy typography, bullet points, and an AI-generated medical illustration.
-    """
     width, height = 1080, 1600
     bg_color = (255, 255, 255)
     navy = (8, 20, 72)
@@ -169,16 +190,12 @@ def create_slide_image(
     draw = ImageDraw.Draw(img)
 
     font_tag = get_font(28, bold=True)
-    font_header = get_font(54, bold=True)
-    font_section = get_font(38, bold=True)
-    font_body = get_font(32, bold=False)
-    font_body_bold = get_font(32, bold=True)
+    font_header = get_font(52, bold=True)
+    font_section = get_font(36, bold=True)
+    font_body_bold = get_font(30, bold=True)
     font_footer = get_font(24, bold=False)
 
-    # Top Tag
     draw.text((width // 2, 70), "THE DIAGNOSIS ROOM", fill=muted_gray, font=font_tag, anchor="mm")
-
-    # Main Header
     draw.text((width // 2, 145), header_title.upper(), fill=navy, font=font_header, anchor="mm")
 
     y_cursor = 230
@@ -188,31 +205,28 @@ def create_slide_image(
                 draw.text((width // 2, y_cursor), sec_title, fill=navy, font=font_section, anchor="mm")
             else:
                 draw.text((110, y_cursor), sec_title, fill=navy, font=font_section)
-            y_cursor += 60
+            y_cursor += 58
 
         for item in items:
-            wrapped_lines = textwrap.wrap(item, width=42)
+            wrapped_lines = textwrap.wrap(str(item), width=42)
             for i, line in enumerate(wrapped_lines):
                 if is_centered:
                     draw.text((width // 2, y_cursor), line, fill=navy, font=font_body_bold, anchor="mm")
                 else:
-                    prefix = "• " if i == 0 and not item.startswith(("A)", "B)", "C)", "D)", "Age:", "Gender:", "History:")) else "   "
-                    if item.startswith(("Age:", "Gender:", "History:", "A)", "B)", "C)", "D)")):
-                        prefix = ""
+                    no_bullet = str(item).startswith(("A)", "B)", "C)", "D)", "Age:", "Gender:", "History:"))
+                    prefix = "" if no_bullet else ("• " if i == 0 else "   ")
                     draw.text((130, y_cursor), f"{prefix}{line}", fill=navy, font=font_body_bold)
-                y_cursor += 46
+                y_cursor += 44
             y_cursor += 8
-        y_cursor += 35
+        y_cursor += 32
 
-    # Paste AI Illustration at the bottom area if space permits
     if illustration_prompt:
-        illust = fetch_ai_illustration(illustration_prompt, size=(280, 280))
+        illust = fetch_ai_illustration(illustration_prompt, size=(260, 260))
         if illust:
-            paste_y = max(y_cursor + 10, height - 360)
-            if paste_y + 280 < height - 60:
-                img.paste(illust, ((width - 280) // 2, paste_y), illust if illust.mode == "RGBA" else None)
+            paste_y = max(y_cursor + 10, height - 340)
+            if paste_y + 260 < height - 60:
+                img.paste(illust, ((width - 260) // 2, paste_y), illust if illust.mode == "RGBA" else None)
 
-    # Bottom Footer
     draw.text((width // 2, height - 40), footer_text, fill=muted_gray, font=font_footer, anchor="mm")
 
     bio = io.BytesIO()
@@ -221,9 +235,6 @@ def create_slide_image(
     return bio
 
 
-# ==============================================================================
-# HELPER FUNCTIONS TO RENDER THE 3 KEY VISUAL CARDS PER CASE
-# ==============================================================================
 def render_card_1_presentation(case: dict) -> io.BytesIO:
     p_info = case["patient_info"]
     sections = [
@@ -286,7 +297,7 @@ def render_card_3_diagnosis(case: dict) -> io.BytesIO:
 
 
 # ==============================================================================
-# KEYBOARD BUILDERS (EACH OPTION ON ITS OWN ROW FOR CLARITY)
+# KEYBOARD BUILDERS (EACH OPTION ON ITS OWN ROW)
 # ==============================================================================
 def build_specialty_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
@@ -300,7 +311,6 @@ def build_specialty_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_mcq_keyboard(options: dict, prefix: str) -> InlineKeyboardMarkup:
-    """Places each option A, B, C, D on its own distinct row."""
     keyboard = []
     for key, text in options.items():
         keyboard.append([InlineKeyboardButton(f"{key}) {text}", callback_data=f"{prefix}_{key}")])
@@ -311,29 +321,18 @@ def build_mcq_keyboard(options: dict, prefix: str) -> InlineKeyboardMarkup:
 # TELEGRAM BOT HANDLERS
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "🩺 *Welcome to The Diagnosis Room!*
+    welcome_text = """🩺 *Welcome to The Diagnosis Room!*
 
-"
-        "Practice your clinical reasoning, clerking, and diagnostic skills with "
-        "interactive undergraduate MBBS cases.
+Practice your clinical reasoning, clerking, and diagnostic skills with interactive undergraduate MBBS cases.
 
-"
-        "How it works:
-"
-        "1️⃣ Review the **Patient Info & Presenting Complaints** slide.
-"
-        "2️⃣ Decide **What to do next**.
-"
-        "3️⃣ Analyze the **Vitals, Physical Exam & Lab Results** slide.
-"
-        "4️⃣ Lock in your **Final Diagnosis**.
-"
-        "5️⃣ Ask any follow-up questions about the case!
+How it works:
+1️⃣ Review the *Patient Info & Presenting Complaints* slide.
+2️⃣ Decide *What to do next*.
+3️⃣ Analyze the *Vitals, Physical Exam & Lab Results* slide.
+4️⃣ Lock in your *Final Diagnosis*.
+5️⃣ Ask any follow-up questions about the case!
 
-"
-        "👇 *Choose a posting/specialty below to start a new case:*"
-    )
+👇 *Choose a posting/specialty below to start a new case:*"""
     await update.message.reply_text(
         welcome_text, parse_mode="Markdown", reply_markup=build_specialty_keyboard()
     )
@@ -352,7 +351,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # 1. Specialty Selection -> Generate New Case
     if data.startswith("spec_"):
         specialty = data.replace("spec_", "")
         if specialty == "Mixed":
@@ -364,8 +362,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["case_counter"] = case_num
 
         status_msg = await query.message.reply_text(
-            f"⏳ *Preparing Case #{case_num} ({specialty})...*
-Generating clinical slides & AI illustration...",
+            f"⏳ *Preparing Case #{case_num} ({specialty})...*\nGenerating clinical slides & AI illustration...",
             parse_mode="Markdown",
         )
 
@@ -382,16 +379,11 @@ Generating clinical slides & AI illustration...",
             case_data = json.loads(response.text)
             context.user_data["current_case"] = case_data
             context.user_data["stage"] = "WAIT_STEP_1"
-            context.user_data["qa_history"] = []
 
-            # Render Slide 1
             slide_1 = render_card_1_presentation(case_data)
             caption = (
-                f"📋 *Case #{case_num} — {specialty}*
-"
-                f"*{case_data['step1_question']}*
-
-"
+                f"📋 *Case #{case_num} — {specialty}*\n"
+                f"*{case_data['step1_question']}*\n\n"
                 f"Select your next clinical step below:"
             )
             await query.message.reply_photo(
@@ -408,7 +400,6 @@ Generating clinical slides & AI illustration...",
                 "⚠️ Sorry, there was an error generating the case. Please tap /newcase to try again."
             )
 
-    # 2. Step 1 Answer ("What would you do next?")
     elif data.startswith("step1_"):
         choice = data.replace("step1_", "")
         case_data = context.user_data.get("current_case")
@@ -421,33 +412,24 @@ Generating clinical slides & AI illustration...",
         user_text = case_data["step1_options"].get(choice, "")
 
         if choice == correct:
-            feedback = f"✅ *Spot on! You chose {choice}) {user_text}*
-
-"
+            feedback = f"✅ *Spot on! You chose {choice}) {user_text}*\n\n"
         else:
             feedback = (
-                f"❌ *Not quite! You chose {choice}) {user_text}*
-"
-                f"✔️ *Best initial step:* {correct}) {correct_text}
-
-"
+                f"❌ *Not quite! You chose {choice}) {user_text}*\n"
+                f"✔️ *Best initial step:* {correct}) {correct_text}\n\n"
             )
-        feedback += f"💡 *Clinical Reasoning:*
-{case_data['step1_explanation']}
-
-⏳ *Loading Clinical Assessment & Results...*"
+        feedback += (
+            f"💡 *Clinical Reasoning:*\n{case_data['step1_explanation']}\n\n"
+            f"⏳ *Loading Clinical Assessment & Results...*"
+        )
 
         await query.message.reply_text(feedback, parse_mode="Markdown")
 
-        # Render Slide 2 (Vitals, Physical Exam, Results, Diagnosis Question)
         slide_2 = render_card_2_assessment(case_data)
         context.user_data["stage"] = "WAIT_STEP_2"
         caption = (
-            f"🩺 *Clinical Assessment & Investigation Results*
-
-"
-            f"*{case_data['step2_question']}*
-"
+            f"🩺 *Clinical Assessment & Investigation Results*\n\n"
+            f"*{case_data['step2_question']}*\n"
             f"Lock in your diagnosis below 👀:"
         )
         await query.message.reply_photo(
@@ -457,7 +439,6 @@ Generating clinical slides & AI illustration...",
             reply_markup=build_mcq_keyboard(case_data["step2_options"], "step2"),
         )
 
-    # 3. Step 2 Answer ("What's your diagnosis?")
     elif data.startswith("step2_"):
         choice = data.replace("step2_", "")
         case_data = context.user_data.get("current_case")
@@ -473,33 +454,28 @@ Generating clinical slides & AI illustration...",
             verdict = f"🎉 *Correct Diagnosis! ({choice}) {user_text})*"
         else:
             verdict = (
-                f"❌ *You selected {choice}) {user_text}*
-"
+                f"❌ *You selected {choice}) {user_text}*\n"
                 f"🎯 *The correct diagnosis is {correct}) {correct_text}*"
             )
 
         await query.message.reply_text(verdict, parse_mode="Markdown")
 
-        # Render Slide 3 (Final Diagnosis & Management Slide)
         slide_3 = render_card_3_diagnosis(case_data)
         context.user_data["stage"] = "QA_MODE"
 
         next_keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("➡️ Start Next Case", callback_data="spec_Mixed")],
-             [InlineKeyboardButton("🗂 Choose Specialty", callback_data="choose_spec")]]
+            [
+                [InlineKeyboardButton("➡️ Start Next Case", callback_data="spec_Mixed")],
+                [InlineKeyboardButton("🗂 Choose Specialty", callback_data="choose_spec")],
+            ]
         )
 
         caption = (
-            f"🏁 *Diagnosis: {case_data['final_diagnosis']}*
-
-"
-            f"💬 *Have questions about this case?*
-"
+            f"🏁 *Diagnosis: {case_data['final_diagnosis']}*\n\n"
+            f"💬 *Have questions about this case?*\n"
             f"Just type your question below (e.g., _'Why was this finding present?'_, "
             f"_'How do we differentiate this from other differentials?'_, or _'What fluids/drugs do we give?'_) "
-            f"and I will explain!
-
-"
+            f"and I will explain!\n\n"
             f"Or tap below when you are ready for the next case:"
         )
         await query.message.reply_photo(
@@ -539,43 +515,48 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "{user_question}"
 
     Provide a clear, mechanism-based, step-by-step explanation tailored to an undergraduate medical student.
-    Keep it well-structured, friendly, and easy to read on Telegram.
-    """
-
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=qa_prompt,
-        )
-        next_keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")],
-             [InlineKeyboardButton("🗂 Choose Specialty", callback_data="choose_spec")]]
-        )
-        await update.message.reply_text(
-            response.text,
-            reply_markup=next_keyboard,
-        )
-    except Exception as e:
-        logger.error(f"Error in Q&A: {e}")
-        await update.message.reply_text(
-            "⚠️ Sorry, I couldn't process that question right now. Please try asking again!"
-        )
-
-
-# ==============================================================================
-# MAIN ENTRYPOINT
-# ==============================================================================
-def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("newcase", new_case_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
-
-    print("🩺 The Diagnosis Room Bot is running! Press Ctrl+C to stop.")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+‎    Keep it well-structured, friendly, and easy to read on Telegram.
+‎    """
+‎
+‎    try:
+‎        response = client.models.generate_content(
+‎            model=MODEL_ID,
+‎            contents=qa_prompt,
+‎        )
+‎        next_keyboard = InlineKeyboardMarkup(
+‎            [
+‎                [InlineKeyboardButton("➡️ Next Case", callback_data="spec_Mixed")],
+‎                [InlineKeyboardButton("🗂 Choose Specialty", callback_data="choose_spec")],
+‎            ]
+‎        )
+‎        await update.message.reply_text(
+‎response.text,
+‎            reply_markup=next_keyboard,
+‎        )
+‎    except Exception as e:
+‎        logger.error(f"Error in Q&A: {e}")
+‎        await update.message.reply_text(
+‎            "⚠️ Sorry, I couldn't process that question right now. Please try asking again!"
+‎        )
+‎
+‎
+‎# ==============================================================================
+‎# MAIN ENTRYPOINT
+‎# ==============================================================================
+‎def main():
+‎    # Start the built-in health server in the background for Render
+‎    threading.Thread(target=start_health_server, daemon=True).start()
+‎
+‎    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+‎
+‎    app.add_handler(CommandHandler("start", start_command))
+‎    app.add_handler(CommandHandler("newcase", new_case_command))
+‎    app.add_handler(CallbackQueryHandler(handle_callback))
+‎    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
+‎
+‎    print("🩺 The Diagnosis Room Bot is running!")
+‎    app.run_polling(drop_pending_updates=True)
+‎
+‎
+‎if __name__ == "__main__":
+‎    main()
