@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_ID = "gemini-3.8-flash"
+MODEL_ID = "gemini-1.5-flash"
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
