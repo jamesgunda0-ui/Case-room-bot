@@ -556,7 +556,5 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ‎
 ‎    print("🩺 The Diagnosis Room Bot is running!")
 ‎    app.run_polling(drop_pending_updates=True)
-‎
-‎
 ‎if __name__ == "__main__":
 ‎    main()
